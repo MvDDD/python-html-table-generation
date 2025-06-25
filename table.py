@@ -1,6 +1,8 @@
 from typing import Any, List, Tuple, Iterator, Union
 import html
 
+import traceback
+
 import http.server, socketserver, threading, webbrowser, json, os
 from urllib.parse import urlparse
 import asyncio, websockets
@@ -16,17 +18,24 @@ class Server:
 		self.http_thread = None
 		self.ws_thread = None
 		self.loop = asyncio.new_event_loop()
+		self._needs_reload = False
 		self.should_stop = False
-
+		spreadsheet.server = self
 		atexit.register(self.stop)
 
-	def update_shortcut(self, inc_filename):
-		self.inc_file = inc_filename
+	def update_shortcut(self, file):
+		import socket
+		ip = socket.gethostbyname(socket.gethostname())
+		f = open(file, "w")
+		f.write(f"<!doctype HTML><html><head><meta http-equiv=\"refresh\" content=\"1;url=http://{ip}:{self.port}\"></head><body><h1>redirection</h1><p>if this page doesnt redirect, click on <a href=\"http://{ip}:{self.port}\">this link</a></p></body></html>")
+		f.close()
 
 	def open_in_browser(self):
 		import socket
 		ip = socket.gethostbyname(socket.gethostname())
 		webbrowser.open(f"http://{ip}:{self.port}")
+		import time
+		time.sleep(5)
 
 	def start(self):
 		self._start_http_server()
@@ -35,16 +44,19 @@ class Server:
 	def _websocket_script(self):
 		return f"""
 	<script>
-	let ws = new WebSocket(`ws://${{location.hostname}}:{self.port + 1}`);
+	let ws = new WebSocket(`ws://${{location.hostname}}:{self.port+1}`);
 	ws.onmessage = msg => {{
 		let data = JSON.parse(msg.data);
+		console.log(data)
 		if (data.type === "update") {{
 			data.cells.forEach(cell => {{
-				let el = document.querySelector(`td[x="${{cell.x}}"][y="${{cell.y}}"]`);
+				let el = document.getElementById(cell.id);
 				if (el) {{
 					el.textContent = cell.value;
 					el.style.background = cell.style.bg;
 					el.style.color = cell.style.color;
+				}} else {{
+					console.log("out of range: Cell(" + cell.x + "," + cell.y + ")"); 
 				}}
 			}});
 		}} else if (data.type === "reload") {{
@@ -62,21 +74,17 @@ class Server:
 	def _start_http_server(self):
 		class Handler(http.server.BaseHTTPRequestHandler):
 			def do_GET(self):
-				if self.path == '/' or self.path.startswith('/index.html'):
-					# Serialize fresh on each request
-					html = self.server_instance.sheet.serialize()
-					if self.server_instance.inc_file and os.path.exists(self.server_instance.inc_file):
-						with open(self.server_instance.inc_file, 'r', encoding='utf8') as f:
-							html += f.read()
-					html += self.server_instance._websocket_script()
-	
-					self.send_response(200)
-					self.send_header("Content-type", "text/html")
-					self.end_headers()
-					self.wfile.write(html.encode("utf8"))
-				else:
-					self.send_error(404, "File not found")
-	
+				html = "<!DOCTYPE html>" + self.server_instance.sheet.serialize()
+				if self.server_instance.inc_file and os.path.exists(self.server_instance.inc_file):
+					with open(self.server_instance.inc_file, 'r', encoding='utf8') as f:
+						html += f.read()
+				html += self.server_instance._websocket_script()
+
+				self.send_response(200)
+				self.send_header("Content-type", "text/html")
+				self.end_headers()
+				self.wfile.write(html.encode("utf8"))
+
 			def log_message(self, format, *args):
 				return  # silence default logging
 	
@@ -108,7 +116,7 @@ class Server:
 				self.clients.remove(websocket)
 	
 		async def run_ws():
-			async with websockets.serve(ws_handler, "0.0.0.0", self.port + 1):
+			async with websockets.serve(ws_handler, "0.0.0.0", self.port+1):
 				await asyncio.Future()  # run forever
 	
 		self.ws_thread = threading.Thread(target=self.loop.run_until_complete, args=(run_ws(),), daemon=True)
@@ -116,22 +124,34 @@ class Server:
 
 
 	def update(self):
-		updates = []
-		for x, y, cell in self.sheet.sheets[0].table[:][:].superRange:
-			if getattr(cell, "dirty", False):
-				updates.append({
-					"x": x, "y": y,
-					"value": cell.value,
-					"style": {
-						"bg": cell.style.background,
-						"color": cell.style.color
-					}
-				})
+		print("needs reload:", self.needs_reload)
+		if self.needs_reload == True:
+			print("reloading")
+			self.needs_reload = False
+			for a,b,cell in self.sheet.sheets[0].table[:][:].superRange:
 				cell.dirty = False
+			self.reload()
+		else:
+			print("updating")
+			updates = []
+			for x, y, cell in self.sheet.sheets[0].table[:][:].superRange:
+				if getattr(cell, "dirty", False):
+					print("dirty:", (x,y))
+					updates.append({
+						"x": x, "y": y,
+						"id": f"cell_{x}_{y}",
+						"value": cell.value,
+						"style": {
+							"bg": cell.style.background,
+							"color": cell.style.color
+						}
+					})
+					cell.dirty = False
 
-		if updates:
-			message = json.dumps({"type": "update", "cells": updates})
-			asyncio.run_coroutine_threadsafe(self._broadcast(message), self.loop)
+
+			if len(updates):
+				message = json.dumps({"type": "update", "cells": updates})
+				asyncio.run_coroutine_threadsafe(self._broadcast(message), self.loop)
 
 	def setClientScroll(self, x, y):
 		self.scroll_pos = (x, y)
@@ -158,6 +178,8 @@ class Server:
 
 
 class SpreadSheet:
+	class BoundToCell:
+		pass
 	class Style:
 		class Font:
 			pass
@@ -172,8 +194,20 @@ class SpreadSheet:
 	pass
 
 class SpreadSheet:
-	class Style:
-		class Font:
+	class BoundToCell:
+		def bind(self, cell):
+			self.cell = cell
+			if cell:
+				cell.dirty = True
+			return self
+
+		def __setattr__(self, name, value):
+			object.__setattr__(self, name, value)
+			if name != "cell" and hasattr(self, "cell") and self.cell is not None:
+				self.cell.dirty = True
+
+	class Style(SpreadSheet.BoundToCell):
+		class Font(SpreadSheet.BoundToCell):
 			def __init__(self, size:float, family:str, modifiers:str):
 				self.size = size
 				self.family = family
@@ -184,7 +218,7 @@ class SpreadSheet:
 				return SpreadSheet.Style.Font(self.size, self.family, self.modifiers)
 			def __str__(self):
 				return f"{self.size} {self.family} {self.modifiers}"
-		class Border:
+		class Border(SpreadSheet.BoundToCell):
 			def __init__(self, dict):
 				self.left = "1px solid #aaa"
 				self.right = "1px solid #aaa"
@@ -212,6 +246,11 @@ class SpreadSheet:
 			self.font = font if isinstance(font, SpreadSheet.Style.Font)  else SpreadSheet.Style.Font(14.0, "calibri", "monospace")
 			self.background = "#ffffff"
 			self.color = "#000"
+
+		def bind(self, cell):
+			super().bind(cell)
+			self.border.bind(cell)
+			self.font.bind(cell)
 		def clone(self):
 			cloned_border = self.border.clone()
 			cloned_font = self.font.clone()
@@ -223,6 +262,7 @@ class SpreadSheet:
 		def __init__(self, value: Any = None, style: SpreadSheet.Style = None):
 			self._value = value
 			self._style = style if style is not None else SpreadSheet.Style()
+			self._style.cell = self
 			self._dirty = True
 			self.formula = None
 		@property
@@ -242,9 +282,17 @@ class SpreadSheet:
 			return self._value
 		@value.setter
 		def value(self, val):
+			self.dirty = True
 			if self.formula is not None:
 				self.formula = None
 			self._value = val
+		@property
+		def style(self):
+			return self._style
+		@style.setter
+		def style(self, new):
+			self._style = new.bind(self)
+
 		def __repr__(self):
 			return f"C({self.value}, S({self.style.border}, {self.style.color}, {self.style.background}, {self.style.font}))"
 		def clone(self):
@@ -252,7 +300,7 @@ class SpreadSheet:
 			newCell = SpreadSheet.Cell(self.value, self.style.clone())
 			if self.formula:
 				newCell.formula = self.formula
-			return 
+			return newCell
 	class Formula:
 		add=0
 		sub=1
@@ -296,6 +344,7 @@ class SpreadSheet:
 				x = slice(x, x + 1)
 			elif not isinstance(x, slice):
 				raise TypeError(f"Unsupported index type: {type(x)}")
+			x = slice(x.start if x.start is not None else 0, x.stop if x.stop is not None else self.width-1, x.step)
 			return SpreadSheet.TableColumnProxy(self, x)
 
 		def __repr__(self):
@@ -306,60 +355,6 @@ class SpreadSheet:
 					row.append(repr(self.data[x][y]))
 				data.append("[" + ", ".join(row) + "]")
 			return "[\n\t" + ",\n\t".join(data) + "\n]"
-		def serialize(self):
-			class Node:
-				def __init__(self, type, contents=None):
-					self.type = type
-					self.contents = contents if contents is not None else []
-				def append(self, *items):
-					self.contents.extend(items)
-				def __str__(self):
-					if isinstance(self.contents, list):
-						inner = " ".join(map(str, self.contents))
-					else:
-						inner = str(self.contents)
-					return f"({self.type} {inner})"
-			tree = Node("table")
-			row = Node("tr")
-			for x in range(self.width+1):
-				row.append(Node("td", Node("string", f"'{number_to_excel_col(x)}'")))
-			tree.append(row)
-			for y in range(self.height):
-				row = Node("tr")
-				row.append(
-					Node("--row", str(y)),
-					Node("td", Node("number", str(y)))
-				)
-				for x in range(self.width):
-					cell = self.data[x][y]
-					item = Node("td")
-					style = Node("style")
-					style.append(
-						Node("border-left",   "'" + cell.style.border.left	 .replace("'", "\\'") + "'"),
-						Node("border-right",  "'" + cell.style.border.right	 .replace("'", "\\'") + "'"),
-						Node("border-top",    "'" + cell.style.border.top	 .replace("'", "\\'") + "'"),
-						Node("border-bottom", "'" + cell.style.border.bottom .replace("'", "\\'") + "'"),
-						Node("background",    "'" + cell.style.background	 .replace("'", "\\'") + "'"),
-						Node("color",         "'" + cell.style.color		 .replace("'", "\\'") + "'"),
-						Node("font-family",   "'" + repr(cell.style.font)	 .replace("'", "\\'") + "'"),
-					)
-					item.append(style, Node("--col",str(x)))
-					if isinstance(cell.value, str):
-						escaped = cell.value.replace("'", "\\'")
-						value = Node("string", f"'{escaped}'")
-					elif isinstance(cell.value, (int, float)):
-						value = Node("number", str(cell.value))
-					elif cell.value is None:
-						value = Node("None")
-					else:
-						escaped = str(cell.value).replace("'", "\\'")
-						value = Node("string", f"'{escaped}'")
-		
-					item.append(value)
-					row.append(item)
-				tree.append(row)
-		
-			return str(tree)
 
 
 		def _expand_to_include(self, x: int, y: int):
@@ -367,15 +362,17 @@ class SpreadSheet:
 			if x >= self.width:
 				for _ in range(self.width, x + 1):
 					self.data.append([SpreadSheet.Cell() for _ in range(self.height)])
-				self.width = x + 1
-			
+				self.width = x+1
+				if self.server is not None:
+					self.server.needs_reload = True
+
 			# Expand rows in each column if needed
 			if y >= self.height:
 				for col in self.data:
 					 col.extend(SpreadSheet.Cell() for _ in range(self.height, y + 1))
 				self.height = y + 1
-			if self.server is not None:
-				self.server.reload()
+				if self.server is not None:
+					self.server.needs_reload = True
 
 	
 	
@@ -405,15 +402,15 @@ class SpreadSheet:
 	
 			# Slice data to new bounding rectangle
 			new_data = []
-			for x in range(min_x, max_x + 1):
-				col = self.data[x][min_y:max_y + 1]
+			for x in range(min_x, max_x):
+				col = self.data[x][min_y:max_y]
 				new_data.append(col)
 	
 			self.data = new_data
 			self.width = new_width
 			self.height = new_height
 			if self.server is not None:
-				self.server.reload()
+				self.server.needs_reload = True
 	
 		def __iter__(self) -> Iterator[Tuple[int, int, SpreadSheet.Cell]]:
 			return self[:][:].superRange
@@ -436,8 +433,10 @@ class SpreadSheet:
 			else:
 				self.x_slice = x_slice
 	
-		def __getitem__(self, y_slice: Union[int, slice]):
-			return SpreadSheet.TableRange(self.table, self.x_slice, y_slice)
+		def __getitem__(self, y: Union[int, slice]):
+			if isinstance(y, slice):
+				y = slice(y.start if y.start is not None else 0, y.stop if y.stop is not None else self.table.height-1, y.step)
+			return SpreadSheet.TableRange(self.table, self.x_slice, y)
 
 
 		def __setitem__(self, y_index: Union[int, slice], cell_value: SpreadSheet.Cell):
@@ -615,7 +614,7 @@ class SpreadSheet:
 	def createSheet(self, name:str, table : SpreadSheet.Table = None):
 		self.sheets.append(SpreadSheet.Sheet(name, table, self.server))
 		if self.server is not None:
-			self.server.reload()
+			self.server.needs_reload = True
 	def serialize(self):
 		def freeze_style(style):
 			return (
@@ -772,7 +771,7 @@ class SpreadSheet:
 					cell = table.data[x][y]
 					cls = cell_classes[x][y]
 					val = cell.value if cell.value is not None else ""
-					row_cells.append(f'<td class="{cls}" x="{x}" y="{y}">{html.escape(str(val))}</td>')
+					row_cells.append(f'<td class="{cls}" id="cell_{x}_{y}">{html.escape(str(val))}</td>')
 				rows_html.append("<tr>" + "".join(row_cells) + "</tr>")
 			all_tables_html.append(f'<div class="TBCC"><div class="TBC {table_index}"><table>\n' + "\n".join(rows_html) + "\n\t</tbody>\n</table></div></div>")
 

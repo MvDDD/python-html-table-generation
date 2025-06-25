@@ -2,20 +2,30 @@ from table import SpreadSheet, Server
 from time import sleep
 
 sheet = SpreadSheet()
-server = Server(sheet, port=8000)
+server = Server(sheet, port=8080)
 sheet.createSheet("sheet1")
 table = sheet.sheets[0].table
-table[10][10].value = 10
 server.start()
+server.update_shortcut("shortcut.htm")
 server.open_in_browser()
-sleep(1)
-table[1][1].value = 100
-server.update()
-try:
-# Keep the main thread alive while the server runs
-	import time
-	while True:
-		time.sleep(1)
-except KeyboardInterrupt:
-	print("Stopping server...")
-	server.stop()
+
+for x,y in [(x,y) for y in range(10) for x in range(10)]:
+	print(f"({x}, {y})")
+	table[x][y].value = f"({x}, {y})"
+
+def forever(start=0):
+	while 1:
+		yield start
+		start += 1
+
+for i in forever(1):
+	sleep(1)
+	print(i)
+
+	for x,y in [(x,y) for y in range(10) for x in range(10)]:
+		table[x][y].value = i
+		table[x][y].dirty = True
+
+	server.update()
+
+server.stop()
