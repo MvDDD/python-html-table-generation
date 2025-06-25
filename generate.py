@@ -1,23 +1,21 @@
-from table import SpreadSheet
-
+from table import SpreadSheet, Server
+from time import sleep
 
 sheet = SpreadSheet()
-for i in range(2):
-	sheet.createSheet(f"{i}")
-
-	table = sheet.sheets[i].table
-
-	# Set a 2D range of values
-	table[0:100][0:100].value = [
-	[f"({x*10}, {y})" for x in range(100)]
-	 for y in range(100)]
-
-for s in sheet.sheets:
-	s.table.clean()
-
-with open("test.html", "w") as f:
-	f.write(sheet.serialize())
-import os
-os.startfile("test.html")
-#import time; time.sleep(5)
-#os.remove("test.html")
+server = Server(sheet, port=8000)
+sheet.createSheet("sheet1")
+table = sheet.sheets[0].table
+table[10][10].value = 10
+server.start()
+server.open_in_browser()
+sleep(1)
+table[1][1].value = 100
+server.update()
+try:
+# Keep the main thread alive while the server runs
+	import time
+	while True:
+		time.sleep(1)
+except KeyboardInterrupt:
+	print("Stopping server...")
+	server.stop()
